@@ -7,31 +7,25 @@
 #include "bsp_i2c.h"
 #include "bsp_display.h"
 #include "bsp_button.h"
-#include "bsp_audio.h"
-#include "bsp_battery.h"
 #include "bsp_pins.h"
 #include "demo.h"
 #include "ui_pixel.h"
 #include "lvgl.h"
 #include "font_cn_16.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "esp_spiffs.h"
-#include "boot_animation.h"
 
 static const char *TAG = "main";
 
 static const demo_entry_t DEMOS[] = {
-    { "显示", demo_display_enter, demo_display_exit, demo_display_key },
-    { "按键", demo_button_enter,  demo_button_exit,  demo_button_key  },
-    { "音频", demo_audio_enter,   demo_audio_exit,   demo_audio_key   },
-    { "电池", demo_battery_enter, demo_battery_exit, demo_battery_key },
-    { "无线", demo_wifi_enter,    demo_wifi_exit,    demo_wifi_key    },
-    { "电子书", demo_ebook_enter, demo_ebook_exit,   demo_ebook_key   },
-    { "智能",   demo_ai_enter,    demo_ai_exit,      demo_ai_key      },
-    { "关于",   demo_about_enter, demo_about_exit,   demo_about_key   },
+    { "无线",   demo_wifi_enter,    demo_wifi_exit,    demo_wifi_key    },
+    { "电子书", demo_ebook_enter,   demo_ebook_exit,   demo_ebook_key   },
+    { "智能",   demo_ai_enter,      demo_ai_exit,      demo_ai_key      },
+    { "关于",   demo_about_enter,   demo_about_exit,   demo_about_key   },
 };
 #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 
@@ -39,6 +33,7 @@ static bool s_ok[DEMO_COUNT];
 static bool s_spiffs_ok;
 
 static lv_obj_t *s_menu_scr;
+static lv_obj_t *s_menu_body;          // 可滚动容器(8 卡片+吉祥物都在里面)
 static lv_obj_t *s_cards[DEMO_COUNT];
 static lv_obj_t *s_rows[DEMO_COUNT];
 static lv_obj_t *s_mascot;
@@ -59,24 +54,33 @@ static void menu_refresh(void) {
 static void menu_build(void) {
     s_menu_scr = ui_pixel_screen_create("FoloToy");
 
+    // 可滚动容器: 4 行卡片超出屏高, 上/下选择时自动滚到选中项
+    s_menu_body = lv_obj_create(s_menu_scr);
+    lv_obj_remove_style_all(s_menu_body);
+    lv_obj_set_size(s_menu_body, 240, 320 - 42);
+    lv_obj_align(s_menu_body, LV_ALIGN_TOP_MID, 0, 42);
+    lv_obj_set_scroll_dir(s_menu_body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_menu_body, LV_SCROLLBAR_MODE_OFF);
+
     for (size_t i = 0; i < DEMO_COUNT; i++) {
         int x, y, w = 102, h = 72;
         if (i < 6) {
             x = 11 + (int)(i % 2) * 112;
-            y = 46 + (int)(i / 2) * 78;
+            y = (int)(i / 2) * 78;
         } else {
             x = 11;
-            y = 46 + 3 * 78 + (int)(i - 6) * 78;
+            y = 3 * 78 + (int)(i - 6) * 78;
             w = 224;
         }
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, w, h, UI_PAPER);
+        s_cards[i] = ui_pixel_panel_create(s_menu_body, x, y, w, h, UI_PAPER);
         s_rows[i] = lv_label_create(s_cards[i]);
         lv_obj_set_style_text_font(s_rows[i], &notosanssc_16, 0);
         lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_center(s_rows[i]);
     }
 
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 280);
+    // 吉祥物放在最后一行卡片下方, 随内容一起滚动
+    s_mascot = ui_pixel_mascot_create(s_menu_body, 101, 2 * 78 + 14);
 
     menu_refresh();
     lv_screen_load(s_menu_scr);
@@ -85,6 +89,9 @@ static void menu_build(void) {
 static void enter_menu(void) {
     s_active = -1;
     menu_build();
+    ESP_LOGI(TAG, "空闲堆: %lu KB, 历史最低: %lu KB",
+             (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024),
+             (unsigned long)(heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT) / 1024));
 }
 
 static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
@@ -99,8 +106,10 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
             DEMOS[s_active].key(btn, ev);
         }
     } else if (ev == BSP_BTN_CLICK) {
-        if (btn == BSP_BTN_UP)   { s_sel = (s_sel + DEMO_COUNT - 1) % DEMO_COUNT; menu_refresh(); }
-        if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh(); }
+        if (btn == BSP_BTN_UP)   { s_sel = (s_sel + DEMO_COUNT - 1) % DEMO_COUNT; menu_refresh();
+                                   lv_obj_scroll_to_view(s_cards[s_sel], LV_ANIM_ON); }
+        if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh();
+                                   lv_obj_scroll_to_view(s_cards[s_sel], LV_ANIM_ON); }
         if (btn == BSP_BTN_OK && s_ok[s_sel]) {
             s_active = s_sel;
             ui_pixel_mascot_jump(s_mascot);
@@ -151,21 +160,18 @@ void app_main(void) {
         ESP_LOGI(TAG, "SPIFFS 挂载成功");
     }
 
-    boot_animation_play();
 
     if (!bsp_lvgl_init()) {
         ESP_LOGE(TAG, "LVGL 初始化失败");
         return;
     }
 
-    s_ok[0] = true;                                   // 显示
-    s_ok[1] = (bsp_button_init(on_key, NULL) == ESP_OK);  // 按键
-    s_ok[2] = (bsp_audio_init() == ESP_OK);           // 音频
-    s_ok[3] = (bsp_battery_init() == ESP_OK);         // 电池
-    s_ok[4] = true;                                   // WiFi(自身处理失败)
-    s_ok[5] = s_spiffs_ok;                            // 电子书
-    s_ok[6] = true;                                   // AI
-    s_ok[7] = true;                                   // 关于
+    s_ok[0] = true;                                   // 无线(自身处理失败)
+    s_ok[1] = s_spiffs_ok;                            // 电子书
+    s_ok[2] = true;                                   // AI
+    s_ok[3] = true;                                   // 关于
+
+    ESP_ERROR_CHECK(bsp_button_init(on_key, NULL));   // 按键(全局必需)
 
     if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
 
