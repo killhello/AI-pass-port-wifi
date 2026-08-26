@@ -4,6 +4,7 @@ idf_component_register(
          "ui_pixel_math.c"
          "demo_ebook.c"
          "ebook_reader.c"
+         "boot_animation.c"
          "wifi_sta.c"
          "ble_prov.c"
          "ai_chat.c"
