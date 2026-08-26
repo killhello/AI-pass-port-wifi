@@ -1,0 +1,118 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ESP-IDF (no Docker)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
+
+          git clone --depth 1 --branch v5.5.3 --recursive https://github.com/espressif/esp-idf.git $HOME/esp-idf
+          $HOME/esp-idf/install.sh esp32c3
+
+      - name: Build firmware
+        run: |
+          . $HOME/esp-idf/export.sh
+
+          idf.py build 2>&1 | tee build.log
+
+          test -f build/FoloToy-AI-Passport.bin || { echo "FAIL: firmware not found"; ls -la build/; tail -100 build.log; exit 1; }
+          ls -lh build/FoloToy-AI-Passport.bin
+
+          # SPIFFS 镜像参数必须与 sdkconfig.defaults 一致:
+          # OBJ_NAME_LEN=32, META_LENGTH=4, USE_MAGIC, USE_MAGIC_LENGTH
+          # 新分区: spiffs @ 0x290000, size 0x570000
+          python $IDF_PATH/components/spiffs/spiffsgen.py 0x570000 spiffs_data build/spiffs.bin \
+            --page-size 256 --block-size 4096 \
+            --obj-name-len 32 --meta-len 4 \
+            --use-magic --use-magic-len
+
+          # 合并为单文件镜像(0x0 起一次性刷入)
+          python -m esptool --chip esp32c3 merge_bin -o build/flash_all.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 8MB \
+            0x0 build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0x10000 build/FoloToy-AI-Passport.bin \
+            0x290000 build/spiffs.bin
+          ls -lh build/flash_all.bin
+
+          echo "=== Build artifacts ==="
+          find build -name "*.bin" -type f | sort
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-passport-ebook-firmware
+          path: |
+            build/FoloToy-AI-Passport.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/spiffs.bin
+            build/flash_all.bin
+            build/flasher_args.json
+          if-no-files-found: error
+
+      - name: Create release zip
+        run: |
+          set -euo pipefail
+          echo "=== 检查构建产物 ==="
+          for f in "build/FoloToy-AI-Passport.bin" \
+                   "build/bootloader/bootloader.bin" \
+                   "build/partition_table/partition-table.bin" \
+                   "build/spiffs.bin"; do
+            if [ ! -f "$f" ]; then
+              echo "错误: 缺少文件 $f"
+              exit 1
+            fi
+            echo "  OK: $f"
+          done
+
+          mkdir -p release
+          cp build/FoloToy-AI-Passport.bin release/firmware.bin
+          cp build/bootloader/bootloader.bin release/
+          cp build/partition_table/partition-table.bin release/
+          cp build/spiffs.bin release/
+          cp build/flash_all.bin release/
+          cp FLASH_GUIDE.md release/ 2>/dev/null || true
+          {
+            echo "========== 推荐方式:单文件刷写 =========="
+            echo "先擦除一次(清除旧固件残留,强烈建议):"
+            echo "  esptool.py --chip esp32c3 -p COM3 erase_flash"
+            echo ""
+            echo "然后一次性刷入(包含 bootloader+分区表+固件+电子书):"
+            echo "  esptool.py --chip esp32c3 -p COM3 -b 460800 write_flash 0x0 flash_all.bin"
+            echo ""
+            echo "========== 备用方式:分文件刷写 =========="
+            echo "esptool.py --chip esp32c3 -p COM3 -b 460800 write_flash \\"
+            echo "  0x0 bootloader.bin \\"
+            echo "  0x8000 partition-table.bin \\"
+            echo "  0x10000 firmware.bin \\"
+            echo "  0x290000 spiffs.bin"
+            echo ""
+            echo "注意:"
+            echo "- 把 COM3 换成实际串口(Linux 为 /dev/ttyACM0 或 /dev/ttyUSB0)"
+            echo "- 必须刷入 partition-table.bin!只刷 firmware.bin 而保留旧分区表,"
+            echo "  会导致 'image length exceeds partition size' 无限重启"
+            echo "- Windows 可用 Flash Download Tool 选择 flash_all.bin,地址填 0x0"
+          } > release/刷写说明.txt
+          echo "=== release 目录 ==="
+          ls -lh release/
+
+      - name: Upload release zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-passport-ebook-release
+          path: release/
+          if-no-files-found: error
